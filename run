@@ -1,0 +1,221 @@
+#!/usr/bin/env guile
+!#
+
+(use-modules  (ice-9 regex)
+	      (ice-9 format)
+	      (ice-9 rdelim))
+
+(define cache-dir "cache")
+(define problem-url-prefix "http://acm.zju.edu.cn/onlinejudge/showProblem.do?problemCode=")
+
+(define url-pat (make-regexp "http://([^/]+)(/.*)"))
+
+(define (http-get url)
+  (define (parse-url string)
+    (let ((m (regexp-exec url-pat string)))
+      (if m 
+	  (cons
+	   (match:substring m 1)
+	   (match:substring m 2))
+	  (error "Bad url:" string))))
+
+  (define (get-address host)
+    (addrinfo:addr
+     (car (getaddrinfo host "80"))))
+
+  (format (current-error-port) "Trying to contact: ~a~%" url)
+  (let* ((uri (parse-url url))
+	 (host (car uri))
+	 (path (cdr uri))
+	 (address (get-address host))
+	 (s (socket PF_INET SOCK_STREAM IPPROTO_IP)))
+    
+    (connect s address)
+
+    (format s "GET ~a HTTP/1.0\r\n\r\n" path)
+
+    (let ((body (read-string s)))
+      (close s)
+      body)))
+
+(define (replace regex s r)
+  (regexp-substitute/global #f regex s 'pre r 'post))
+
+(define (strip-tags s)
+  (replace "(<[^<>]+?>|\r\n)" s ""))
+
+(define (unescape s)
+  (replace 
+   "&lt;" 
+   (replace "&gt;" s ">")
+   "<"))
+
+(define regex-pre 
+  (make-regexp 
+   "ample input[^\n]*[\n ]*(<pre>)[\n ]*(.+?)[\n ]+(</pre>).*ample output[^\n]*[\n ]*(<pre>)[\n ]*(.+?)[\n ]+(</pre>)"
+   regexp/icase))
+
+(define regex-newline 
+  (make-regexp 
+   "ample input[^\n]*[\n ]*(\n)(.+?)(\n).*ample output[^\n]*[\n ]*(\n)(.+?)(\n)"
+   regexp/icase))
+
+(define (strip-lines text)
+  (let ((lines (lines->list text)))
+    (string-join (map string-trim-both lines) "\n")))
+  
+(define (write-sample problem-id text type strip?)
+    (with-output-to-file 
+	(if (eq? type 'in)
+	    (sample-input problem-id)
+	    (sample-output problem-id))
+      (lambda ()
+	(if strip?
+	    (write-line (strip-lines (unescape text)))
+	    (write-line (unescape text))))))
+    
+(define (sample-input problem-id)
+  (format #f "~a/~a-~a.txt" cache-dir problem-id "in"))
+
+(define (sample-output problem-id)
+  (format #f "~a/~a-~a.txt" cache-dir problem-id "out"))
+
+(define (sample-exists? problem-id)
+  (and (file-exists? (sample-input problem-id))
+       (file-exists? (sample-output problem-id))))
+
+(define (fetch-problem problem-id)
+  (let* ((body (http-get (problem-url problem-id)))
+	 (m (or (regexp-exec regex-pre body)
+		(regexp-exec regex-newline (strip-tags body)))))
+    (if m
+	(let ((strip? (string=? (match:substring m 1) "\n")))
+	  (write-sample problem-id (match:substring m 2) 'in strip?)
+	  (write-sample problem-id (match:substring m 5) 'out strip?))
+	(fail "Problem input output text not found")))) 
+
+(define (problem-url problem-id)
+  (string-append problem-url-prefix problem-id))
+
+(define (ensure-cache-dir!)
+  (if (and (file-exists? cache-dir) (file-is-directory?  cache-dir))
+      #t
+      (catch 'system-error
+	(lambda ()
+	  (mkdir cache-dir))
+	(lambda e
+	  (let ((errno (system-error-errno e)))
+	    (fail (strerror errno))
+	    #f)))))
+
+(define (fail reason . args)
+  (format (current-error-port) "~a~%~a ~%"
+	  (highlight "Run failed:")
+	  (if (null? args) 
+	      reason
+	      (apply format #f reason args)))
+  (exit 1))
+
+(define (problem-input problem-id)
+  (let ((input-file 
+	 (string-append cache-dir "/" problem-id "-in.txt")))
+    (if (file-exists? input-file)
+	input-file
+	(fail "No input file `~a'" input-file))))
+
+(define (sample problem-id)
+  (or (sample-exists? problem-id)
+      (fetch-problem problem-id))
+  (values (sample-input problem-id)
+	  (sample-output problem-id)))
+
+(define (file->string filename)
+  (with-input-from-file filename
+    (lambda ()
+      (read-string))))
+
+(define (run-scm-with-input scm-file in)
+  (with-output-to-string
+    (lambda () 
+      (with-input-from-file in
+	(lambda ()
+	  (load scm-file))))))
+
+(define (lines->list s)
+  (with-input-from-string s
+    (lambda ()
+      (let lp ((l (read-line))
+	       (result '()))
+	(if (eof-object? l)
+	    (reverse! result)
+	    (lp (read-line) (cons l result)))))))
+
+(define (diff-output s1 s2)
+  (define (safe-car x)
+    (if (null? x)
+	""
+	(car x)))
+
+  (define (safe-cdr x)
+    (if (null? x)
+	'()
+	(cdr x)))
+
+  (define (iter l1 l2)
+    (if (not (or (null? l1) (null? l2)))
+	(let ((x1 (safe-car l1))
+	      (x2 (safe-car l2)))
+	  (if (string=? x1 x2)
+	      (format #t "|~40a |~a~%" x1 x2)
+	      (format #t "|~40a |~a~%" x1 (highlight x2)))
+	  (iter (safe-cdr l1) (safe-cdr l2))))) 
+
+  (define (display-verbatim)
+    (newline)
+    (display s1)
+    (newline)
+    (display (highlight s2)))
+  
+  (let ((lines1 (lines->list s1))
+	(lines2 (lines->list s2)))	
+    (with-output-to-string
+      (lambda ()
+	(if (< (apply max (map string-length lines1)) 40)
+	    (iter lines1 lines2)
+	    (display-verbatim))))))
+
+(define (run problem-id)
+  (let ((scm-file (string-append problem-id ".scm")))
+    (if (file-exists? scm-file)
+	(call-with-values 
+	    (lambda () (sample problem-id))
+	  (lambda (in out)
+	    (let ((result (run-scm-with-input scm-file in))
+		  (standard-result (file->string out)))
+	      (if (string=? result standard-result)
+		  (display (ok "Passed\n"))
+		  (fail "diff [answer] ~~ [your answer] ~%~a" 
+			(diff-output standard-result result))))))
+	(fail "~a not exist" scm-file))))
+
+(define (highlight s)
+  (format #f "~c[31m~a~c[m" #\esc s #\esc))
+
+(define (ok s)
+  (format #f "~c[32m~a~c[m" #\esc s #\esc))
+
+(define (usage)
+  (format #t "Usage: ~a problem-id~%" (car (command-line)))
+  (exit 1))
+
+(define (main args)
+  (if (null? (cdr args))
+      (usage)
+      (ensure-cache-dir!))
+  (run (cadr args)))
+
+(main (command-line))
+
+;;
+;;
+;;
